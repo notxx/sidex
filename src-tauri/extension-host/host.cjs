@@ -415,10 +415,27 @@ class ExtensionHost extends EventEmitter {
     }
   }
 
-  _handleActivateExtension(id, params) {
+    async _handleActivateExtension(id, params) {
+    const startTime = Date.now();
+    let extensionId;
     try {
-      const { extensionId } = params;
+      extensionId = params && params.extensionId;
+      if (!extensionId) {
+        return { id, result: { ok: false, extensionId: null, error: { code: 'MissingExtensionId', message: 'No extensionId provided' } } };
+      }
       const ext = this._extensions.get(extensionId);
+
+      if (!ext) {
+        log(`[ext-host/activation] ${extensionId} not found`);
+        return { id, result: { ok: false, extensionId, durationMs: Date.now() - startTime, error: { code: 'ExtensionNotFound', message: `Extension ${extensionId} not found in registry` } } };
+      }
+
+      // If previously failed, return consistent failure immediately
+      if (this._failedExtensions.has(extensionId)) {
+        log(`[ext-host/activation] ${extensionId} previously failed, skipping`);
+        return { id, result: { ok: false, extensionId, durationMs: Date.now() - startTime, error: { code: 'PreviouslyFailed', message: 'Extension previously failed activation' } } };
+      }
+
       if (ext && !ext.activated) {
         const events = ext.manifest?.activationEvents || [];
         const hasStar = events.includes('*') || events.length === 0;
@@ -428,15 +445,55 @@ class ExtensionHost extends EventEmitter {
             this._deferredStartupActivations = new Set();
           }
           this._deferredStartupActivations.add(extensionId);
-          return { id, result: { activated: false, deferred: true } };
+          return { id, result: { ok: true, extensionId, activated: false, deferred: true, durationMs: Date.now() - startTime } };
         }
       }
-      this._activateExtension(extensionId).catch((e) => {
-        log(`activation error (${extensionId}): ${e.message}`);
-      });
-      return { id, result: { activated: true } };
+
+      if (ext && ext.activated) {
+        return { id, result: { ok: true, extensionId, alreadyActive: true, durationMs: 0 } };
+      }
+
+      const activationResult = await this._activateExtension(extensionId);
+      const durationMs = Date.now() - startTime;
+
+      // Check sentinel result from _activateExtension first
+      if (activationResult && typeof activationResult === 'object' && '_sidex_result' in activationResult) {
+        const sentinel = activationResult._sidex_result;
+        if (sentinel === 'not_found') {
+          log(`[ext-host/activation] ${extensionId} not found in registry`);
+          return { id, result: { ok: false, extensionId, durationMs, error: { code: 'ExtensionNotFound', message: `Extension ${extensionId} not found in registry` } } };
+        }
+        if (sentinel === 'previously_failed') {
+          log(`[ext-host/activation] ${extensionId} previously failed, skipping`);
+          return { id, result: { ok: false, extensionId, durationMs, error: { code: 'PreviouslyFailed', message: 'Extension previously failed activation' } } };
+        }
+        if (sentinel === 'main_missing') {
+          log(`[ext-host/activation] ${extensionId} main file not found on disk`);
+          return { id, result: { ok: false, extensionId, durationMs, error: { code: 'MainFileMissing', message: 'Main entry file not found on disk' } } };
+        }
+        if (sentinel === 'no_main_noop') {
+          // Theme/contributes-only extensions with no main entry point.
+          // These are valid extensions that provide static contributions.
+          // Return ok:true with a flag so the frontend can distinguish.
+          log(`[ext-host/activation] ${extensionId} no main entry (theme/contributes-only), activated as noop`);
+          return { id, result: { ok: true, extensionId, activated: true, noEntrypointNoop: true, durationMs } };
+        }
+      }
+
+      // Post-state check for normal activation success
+      const afterExt = this._extensions.get(extensionId);
+      if (afterExt && afterExt.activated && !this._failedExtensions.has(extensionId)) {
+        log(`[ext-host/activation] ${extensionId} activated in ${durationMs}ms`);
+        return { id, result: { ok: true, extensionId, activated: true, durationMs } };
+      }
+
+      // Fallback: activation did not succeed
+      log(`[ext-host/activation] ${extensionId} not activated`);
+      return { id, result: { ok: false, extensionId, durationMs, error: { code: 'ActivationIncomplete', message: 'Activation returned without completing' } } };
     } catch (e) {
-      return { id, error: e.message };
+      const durationMs = Date.now() - startTime;
+      log(`[ext-host/activation] ${extensionId || '?'} failed after ${durationMs}ms: ${e.message}`);
+      return { id, result: { ok: false, extensionId: (params && params.extensionId) || null, durationMs, error: { code: 'ActivationFailed', message: e.message, stack: (e.stack || '').substring(0, 500) } } };
     }
   }
 
@@ -1521,20 +1578,24 @@ class ExtensionHost extends EventEmitter {
 
   async _activateExtension(extensionId) {
     const ext = this._extensions.get(extensionId);
-    if (!ext) return null;
+    if (!ext) return { _sidex_result: 'not_found' };
     if (ext.activated) return ext.exports;
     if (this._activationPromises.has(extensionId)) return this._activationPromises.get(extensionId);
-    if (this._failedExtensions.has(extensionId)) return null;
+    if (this._failedExtensions.has(extensionId)) return { _sidex_result: 'previously_failed' };
     if (!ext.manifest.main) {
+      // No main entry point: theme/contributes-only extensions are valid.
+      // Mark as activated but return a distinguishable result.
       ext.activated = true;
-      return;
+      return { _sidex_result: 'no_main_noop' };
     }
 
     const mainPath = path.resolve(ext.extensionPath, ext.manifest.main);
     if (!fs.existsSync(mainPath) && !fs.existsSync(mainPath + '.js')) {
       log(`main not found: ${mainPath}`);
-      ext.activated = true;
-      return;
+      // Do NOT set ext.activated = true for missing main. Record as failed so
+      // subsequent activate attempts return ok:false / MainFileMissing consistently.
+      this._failedExtensions.add(extensionId);
+      return { _sidex_result: 'main_missing' };
     }
 
     const context = this._createExtensionContext(extensionId, ext);
@@ -5170,6 +5231,12 @@ if (process.env.SIDEX_EXTENSION_HOST === 'true' && process.send) {
   });
 
   process.send({ type: 'VSCODE_EXTHOST_IPC_READY' });
+  // Signal to server.cjs that the extension host is fully initialized
+  process.send({
+    type: 'sidex:host-ready',
+    extensionCount: hostInstance._extensions ? hostInstance._extensions.size : (initData && initData.extensions ? initData.extensions.length : 0),
+    extensionIds: hostInstance._extensions ? Array.from(hostInstance._extensions.keys()) : []
+  });
   log('extension host process running in IPC mode');
 } else {
   module.exports = hostInstance;

@@ -127,6 +127,9 @@ function sanitizeForExtHost(text: string): string {
 
 interface HandshakeMessage {
 	type: 'sidex:handshake';
+	sessionId?: string;
+	hostReady?: boolean;
+	hostReadyTimeout?: boolean;
 	connectionToken: string;
 	reconnectionToken: string;
 	extensionCount: number;
@@ -152,7 +155,11 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	}>();
 	private _connected = false;
 	private _handshakeSeen = false;
+	private _sessionId: string | undefined;
+	private _hostReadyRetries = 0;
+	private _hostReady = false;
 	private _providerRegistrations: IDisposable[] = [];
+	private _failedActivations: string[] = [];
 	private _documentsSyncInitialized = false;
 	private _activeEditorSyncInitialized = false;
 	private _editorTrackingInitialized = false;
@@ -541,7 +548,9 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 			ws.onopen = () => {
 				this._connected = true;
 				this._handshakeSeen = false;
+				this._hostReady = false;
 				this._reconnectAttempts = 0;
+				// ws_connected reported after server-session (when sessionId is known)
 				const workspaceFolders = this.workspaceContextService
 					.getWorkspace()
 					.folders
@@ -566,7 +575,12 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 				this._ws = undefined;
 				this._connected = false;
 				this._handshakeSeen = false;
+				this._hostReady = false;
 				this._capabilitiesQueried = false;
+				clearTimeout(this._capabilityRetryTimer);
+				this._capabilityRetryTimer = undefined;
+				this.logService.info('[ExtHost/ws] disconnected (session=' + (this._sessionId || 'unknown') + ')');
+				this._reportLifecycleEvent('extension_platform_report_ws_closed');
 				this._rejectPending('connection closed');
 				this._scheduleReconnect();
 			};
@@ -583,15 +597,29 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	}
 
 	private _scheduleReconnect(): void {
-		if (this._reconnectTimer || !this._port || this._reconnectAttempts >= 3) {
+		if (this._reconnectTimer || !this._port) {
+			return;
+		}
+		// Two-tier retry:
+		// - WS connection retries (_reconnectAttempts): reset on ws.onopen()
+		// - hostReady timeout retries (_hostReadyRetries): NOT reset on reconnect
+		const wsMax = this._hostReady ? 3 : 10;
+		const hostReadyMax = 3;
+		if (this._hostReadyRetries >= hostReadyMax) {
+			this.logService.error('[ExtHost/status] hostReady not received after ' + hostReadyMax + ' reconnects. Giving up. (session=' + (this._sessionId || 'unknown') + ')');
+			return;
+		}
+		if (this._reconnectAttempts >= wsMax) {
+			this.logService.warn('[ExtHost/ws] max reconnection attempts reached (' + wsMax + ', hostReady=' + this._hostReady + ', session=' + (this._sessionId || 'unknown') + ')');
 			return;
 		}
 		this._reconnectAttempts++;
 		const delay = Math.min(1000 * Math.pow(2, this._reconnectAttempts - 1), 30000);
+		this.logService.info('[ExtHost/ws] reconnecting in ' + delay + 'ms (attempt ' + this._reconnectAttempts + '/' + wsMax + ', hostReadyRetries=' + this._hostReadyRetries + '/' + hostReadyMax + ', hostReady=' + this._hostReady + ', session=' + (this._sessionId || 'unknown') + ')');
 		this._reconnectTimer = setTimeout(() => {
 			this._reconnectTimer = undefined;
 			if (this._port && (!this._ws || this._ws.readyState === WebSocket.CLOSED)) {
-				this._connect(`ws://127.0.0.1:${this._port}`);
+				this._connect('ws://127.0.0.1:' + this._port);
 			}
 		}, delay);
 	}
@@ -649,6 +677,13 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		}
 	}
 
+	private _reportLifecycleEvent(command: string): void {
+		const sid = this._sessionId;
+		import('@tauri-apps/api/core').then(({ invoke }) => {
+			invoke(command, { sessionId: sid || '' }).catch(() => {});
+		}).catch(() => {});
+	}
+
 	private _rejectPending(reason: string): void {
 		for (const [, cb] of this._pendingCallbacks) {
 			clearTimeout(cb.timeoutHandle);
@@ -675,8 +710,16 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		if (!this._connected || this._ws?.readyState !== WebSocket.OPEN) {
 			return Promise.reject(new Error(`ExtHost request '${type}' skipped: connection not ready`));
 		}
-		if (!options?.allowBeforeHandshake && !this._handshakeSeen) {
-			return Promise.reject(new Error(`ExtHost request '${type}' skipped: handshake not ready`));
+		// Gate on hostReady: handshake must be received AND hostReady must be true.
+		// Only requests with explicit allowBeforeHandshake bypass this gate
+		// (e.g. initialize, resetPanels which are needed before host is ready).
+		if (!options?.allowBeforeHandshake) {
+			if (!this._handshakeSeen) {
+				return Promise.reject(new Error(`ExtHost request '${type}' skipped: handshake not received yet`));
+			}
+			if (!this._hostReady) {
+				return Promise.reject(new Error(`ExtHost request '${type}' skipped: handshake received but hostReady=false`));
+			}
 		}
 		const timeoutMs = options?.timeoutMs ?? 10000;
 		return new Promise((resolve, reject) => {
@@ -717,12 +760,42 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		}
 
 		switch (msg.type) {
+			case 'sidex:server-session':
+				if (msg.sessionId) {
+					this._sessionId = msg.sessionId;
+					// Report ws_connected now that we have a valid sessionId
+					this._reportLifecycleEvent('extension_platform_report_ws_connected');
+				}
+				this.logService.info('[ExtHost/handshake] server-session received (session=' + (msg.sessionId || 'unknown') + ')');
+				break;
+			case 'sidex:host-exited':
+				this.logService.warn('[ExtHost/status] host process exited (code=' + msg.code + ' signal=' + msg.signal + ')');
+				// Report HostExited lifecycle state to Rust
+				this._reportLifecycleEvent('extension_platform_report_host_exited');
+				// Check whether we ever received a successful handshake before this exit
+				const wasEverHostReady = this._hostReady;
+				this._hostReady = false;
+				this._handshakeSeen = false;
+				this._rejectPending('host-exited');
+				// If host exits before ever reaching hostReady, increment retry counter
+				// to avoid infinite reconnect loops. _scheduleReconnect checks
+				// _hostReadyRetries and gives up at 3.
+				if (!wasEverHostReady) {
+					this._hostReadyRetries++;
+					this.logService.warn(`[ExtHost/status] host exited before ready, retry ${this._hostReadyRetries}/3`);
+				} else {
+					this.logService.info('[ExtHost/status] host exited after ready, will reconnect');
+				}
+				break;
 			case 'sidex:handshake':
 				this._onHandshake(msg as HandshakeMessage);
 				break;
 			case 'extensionActivated':
 				this._activatedCount++;
-				this._queryAndRegisterProviders();
+				// Provider query is done once after all activations settle in _onHandshake.
+				// Individual extensionActivated events no longer trigger queries to avoid
+				// races where a fast extension sets _capabilitiesQueried=true before
+				// later extensions are registered.
 				break;
 			case 'commandRegistered':
 				this._onCommandRegistered(msg.commandId);
@@ -1128,7 +1201,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	private _onWebviewViewPostMessage(webviewHandle: string, message: any): void {
 		const handles = this._findWebviewHandles(webviewHandle);
 		if (handles) {
-			this.logService.info(`[ExtHost] webviewViewPostMessage → ${webviewHandle}: ${JSON.stringify(message).substring(0, 200)}`);
+			this.logService.info(`[ExtHost] webviewViewPostMessage -> ${webviewHandle}: ${JSON.stringify(message).substring(0, 200)}`);
 			handles.webview.postMessage(message);
 		} else {
 			this.logService.warn(`[ExtHost] webviewViewPostMessage: handle ${webviewHandle} not found`);
@@ -1162,6 +1235,8 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 
 	private _onHandshake(msg: HandshakeMessage): void {
 		this._handshakeSeen = true;
+		this._hostReady = msg.hostReady === true;
+		this._sessionId = msg.sessionId || this._sessionId;
 		this._extensionCount = msg.extensionCount;
 		this._activatedCount = 0;
 		this._capabilitiesQueried = false;
@@ -1169,21 +1244,84 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		this._capabilityRetryCount = 0;
 		clearTimeout(this._capabilityRetryTimer);
 		this._capabilityRetryTimer = undefined;
-		this.logService.info(`[ExtHost] Connected — ${msg.extensionCount} extensions`);
+
+		// hostReady timeout: increment retry counter and close socket to trigger reconnect.
+		// ws.onclose handles _rejectPending and _scheduleReconnect, so we only close
+		// the socket here to avoid duplicate state changes.
+		if (msg.hostReadyTimeout === true) {
+			this._hostReadyRetries++;
+			this.logService.warn(`[ExtHost/status] hostReady timeout, retry ${this._hostReadyRetries}/3 (session=${msg.sessionId || 'unknown'})`);
+			this._reportLifecycleEvent('extension_platform_report_host_ready_timeout');
+			if (this._ws) {
+				this._ws.close(4001, 'host-ready-timeout');
+				// ws.onclose will fire, reset state and call _scheduleReconnect
+			}
+			return;
+		}
+
+		this._hostReadyRetries = 0;
+		this.logService.info(`[ExtHost] Connected - ${msg.extensionCount} extensions`);
 
 		this._request('resetPanels', {}, { timeoutMs: 3000, allowBeforeHandshake: true }).catch(() => {});
 
-		for (const ext of msg.extensions) {
-			this._send({ id: this._nextId(), type: 'activateExtension', params: { extensionId: ext.id } });
+		// Only activate extensions if hostReady is true
+		if (msg.hostReady === true) {
+			// Notify Rust side that host is ready
+			this._reportLifecycleEvent('extension_platform_report_host_ready');
+			// Re-sync documents, active editor, and tracked editors delta:
+			// ws.onopen may have sent these before hostReady, and server's
+			// hostReady gate would have dropped them.
+			this._syncOpenDocuments();
+			this._sendActiveEditor();
+			this._sendCurrentEditorsSnapshot();
+
+			this._failedActivations = [];
+			const activationPromises = msg.extensions.map((ext) => {
+				return this._request('activateExtension', { extensionId: ext.id }, { timeoutMs: 60000 })
+					.then((result: any) => {
+						if (result?.ok === true) {
+							this.logService.info(`[ExtHost/activation] ${ext.id}: ok durationMs=${result?.durationMs ?? '?'}`);
+							return true;
+						} else {
+							this._failedActivations.push(ext.id);
+							this.logService.warn(`[ExtHost/activation] ${ext.id} returned ok=${String(result?.ok)} (durationMs=${result?.durationMs ?? '?'})`);
+							return false;
+						}
+					})
+					.catch((err: Error) => {
+						this._failedActivations.push(ext.id);
+						this.logService.warn(`[ExtHost/activation] ${ext.id} failed: ${err.message}`);
+						return false;
+					});
+			});
+			// Wait for all activations to settle, then check if any succeeded
+			Promise.allSettled(activationPromises).then((results) => {
+				const anyOk = results.some(r => r.status === 'fulfilled' && r.value === true);
+				if (!anyOk && msg.extensions.length > 0) {
+					this.logService.error(`[ExtHost/activation] all ${msg.extensions.length} extensions failed to activate. Entering degraded state.`);
+					this._reportLifecycleEvent('extension_platform_report_activation_failed');
+					// Do NOT proceed with state sync or provider query when all fail
+					return;
+				}
+				if (this._failedActivations.length > 0) {
+					this.logService.warn(`[ExtHost/activation] ${this._failedActivations.length}/${msg.extensions.length} extensions failed: ${this._failedActivations.join(', ')}. Proceeding with partial state.`);
+				}
+				// Proceed with state sync and provider query after activations settle
+				this._syncExtensionState();
+				setTimeout(() => {
+					if (!this._capabilitiesQueried) {
+						this._queryAndRegisterProviders();
+					}
+				}, 3000);
+			});
+		} else {
+			this.logService.warn(`[ExtHost/activation] hostReady=false, skipping extension activation (session=${msg.sessionId || 'unknown'})`);
+			this.logService.warn(`[ExtHost/activation] also skipping _syncExtensionState and provider query until hostReady`);
+			return;
 		}
 
-		this._syncExtensionState();
-
-		setTimeout(() => {
-			if (!this._capabilitiesQueried) {
-				this._queryAndRegisterProviders();
-			}
-		}, 3000);
+		// Note: _syncExtensionState and provider query moved inside Promise.allSettled
+		// to ensure they run after activations complete.
 	}
 
 	private _syncExtensionState(): void {
@@ -1191,7 +1329,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 			commands: string[];
 			webviewViewProviders: string[];
 			customEditorProviders: string[];
-		}>('getExtensionState', {}, { timeoutMs: 5000, allowBeforeHandshake: true }).then(
+		}>('getExtensionState', {}, { timeoutMs: 5000 }).then(
 			(state) => {
 				if (!state) { return; }
 				for (const cmd of state.commands) {
@@ -1214,12 +1352,12 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		try {
 			const caps = await this._request<ProviderCapabilities>('getProviderCapabilities');
 			if (!caps || Object.keys(caps).length === 0) {
-				if (!this._capabilitiesQueried && this._connected && this._capabilityRetryCount < 5) {
+				if (this._connected && this._capabilityRetryCount < 5) {
 					this._capabilityRetryCount++;
 					clearTimeout(this._capabilityRetryTimer);
 					this._capabilityRetryTimer = setTimeout(() => {
 						this._capabilityRetryTimer = undefined;
-						if (this._connected && !this._capabilitiesQueried) {
+						if (this._connected) {
 							this._queryAndRegisterProviders();
 						}
 					}, 1000);
@@ -1253,7 +1391,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 			return unique.length > 0 ? unique as LanguageSelector : '*';
 		};
 
-		// SideX: New capability format — `{selector, extensionId, displayName}[]`.
+		// SideX: New capability format - `{selector, extensionId, displayName}[]`.
 		// Old format was just `selector[][]` (arrays of selectors). Normalize.
 		const normalizeProviders = (raw: any): Array<{ selector: unknown[]; extensionId?: string; displayName?: string }> => {
 			if (!Array.isArray(raw)) { return []; }
@@ -2355,6 +2493,192 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		updateState();
 	}
 
+	// Track a single editor instance: registers listeners for selection, config,
+	// scroll, and key events. Used by both _startEditorTracking and
+	// _sendCurrentEditorsSnapshot to ensure reconnected editors get full listeners.
+	private _trackEditorInstance(editor: ICodeEditor): boolean {
+		const shouldTrackFn = (ed: ICodeEditor): boolean => {
+			if ((ed as any).isSimpleWidget) { return false; }
+			const model = ed.getModel();
+			return !!model && isSyncedModelScheme(model.uri.scheme);
+		};
+		if (!shouldTrackFn(editor)) { return false; }
+		const getEditorId = (ed: ICodeEditor): string => {
+			const model = ed.getModel();
+			return `${ed.getId()},${model?.id ?? 'null'}`;
+		};
+		const editorId = getEditorId(editor);
+		if (this._trackedEditors.has(editorId)) { return false; }
+
+		const listeners: IDisposable[] = [];
+		const model = editor.getModel()!;
+
+		listeners.push(editor.onDidChangeCursorSelection((e) => {
+			if (!this._connected) { return; }
+			if (!isSyncedModelScheme(model.uri.scheme)) { return; }
+			const allSelections = editor.getSelections() || [];
+			this._send({
+				id: this._nextId(),
+				type: 'editorPropertiesChanged',
+				params: {
+					editorId,
+					selections: {
+						selections: allSelections.map((s: any) => ({
+							anchor: { line: s.selectionStartLineNumber - 1, character: s.selectionStartColumn - 1 },
+							active: { line: s.positionLineNumber - 1, character: s.positionColumn - 1 },
+						})),
+						source: e.source || 'keyboard',
+					},
+					options: null,
+					visibleRanges: null,
+				},
+			});
+		}));
+
+		listeners.push(editor.onDidChangeConfiguration(() => {
+			if (!this._connected) { return; }
+			if (!isSyncedModelScheme(model.uri.scheme)) { return; }
+			const config = editor.getOptions();
+			this._send({
+				id: this._nextId(),
+				type: 'editorPropertiesChanged',
+				params: {
+					editorId,
+					selections: null,
+					options: {
+						tabSize: model.getOptions().tabSize,
+						insertSpaces: model.getOptions().insertSpaces,
+						cursorStyle: config.get(34),
+						lineNumbers: config.get(76)?.renderType ?? 1,
+					},
+					visibleRanges: null,
+				},
+			});
+		}));
+
+		listeners.push(editor.onDidScrollChange(() => {
+			if (!this._connected) { return; }
+			const vr = editor.getVisibleRanges() || [];
+			this._send({
+				id: this._nextId(),
+				type: 'editorPropertiesChanged',
+				params: {
+					editorId,
+					selections: null,
+					options: null,
+					visibleRanges: vr.map((r: any) => ({
+						start: { line: r.startLineNumber - 1, character: r.startColumn - 1 },
+						end: { line: r.endLineNumber - 1, character: r.endColumn - 1 },
+					})),
+				},
+			});
+		}));
+
+		listeners.push(editor.onKeyDown((e: any) => {
+			if (!this._connected) { return; }
+			if (e.keyCode === 9 /* Escape */) {
+				const cmd = this._registeredCommands.has('extension.vim_escape') ? 'extension.vim_escape' : null;
+				if (cmd) {
+					e.preventDefault();
+					e.stopPropagation();
+					this._request('executeCommand', { command: cmd, args: [] }, { timeoutMs: 1000 }).catch(() => {});
+				}
+			}
+		}));
+
+		this._trackedEditors.set(editorId, { editor, uri: model.uri.toString(), listeners });
+		return true;
+	}
+
+	// Re-send current tracked editors snapshot (for use after hostReady/reconnect).
+	// Re-scans all current code editors to pick up additions/removals during disconnect.
+	// Uses _trackEditorInstance to ensure new editors get full event listeners.
+	private _sendCurrentEditorsSnapshot(): void {
+		if (!this._connected) { return; }
+		const getEditorState = (editor: ICodeEditor) => {
+			const model = editor.getModel()!;
+			const selections = editor.getSelections() || [];
+			const config = editor.getOptions();
+			const visibleRanges = editor.getVisibleRanges() || [];
+			return {
+				id: `${editor.getId()},${model?.id ?? 'null'}`,
+				documentUri: model.uri.toString(),
+				selections: selections.map((s: any) => ({
+					anchor: { line: s.selectionStartLineNumber - 1, character: s.selectionStartColumn - 1 },
+					active: { line: s.positionLineNumber - 1, character: s.positionColumn - 1 },
+				})),
+				options: {
+					tabSize: model.getOptions().tabSize,
+					insertSpaces: model.getOptions().insertSpaces,
+					cursorStyle: config.get(34),
+					lineNumbers: config.get(76)?.renderType ?? 1,
+				},
+				visibleRanges: visibleRanges.map((r: any) => ({
+					start: { line: r.startLineNumber - 1, character: r.startColumn - 1 },
+					end: { line: r.endLineNumber - 1, character: r.endColumn - 1 },
+				})),
+				viewColumn: 1,
+			};
+		};
+		const shouldTrack = (editor: ICodeEditor): boolean => {
+			if ((editor as any).isSimpleWidget) { return false; }
+			const model = editor.getModel();
+			return !!model && isSyncedModelScheme(model.uri.scheme);
+		};
+		// Re-scan all current code editors
+		const currentEditors = new Map<string, ICodeEditor>();
+		for (const editor of this.codeEditorService.listCodeEditors()) {
+			if (shouldTrack(editor)) {
+				currentEditors.set(`${editor.getId()},${editor.getModel()?.id ?? 'null'}`, editor);
+			}
+		}
+		// Remove stale tracked editors that no longer exist
+		const removed: string[] = [];
+		for (const [id] of this._trackedEditors) {
+			if (!currentEditors.has(id)) {
+				const entry = this._trackedEditors.get(id)!;
+				entry.listeners.forEach(l => l.dispose());
+				this._trackedEditors.delete(id);
+				removed.push(id);
+			}
+		}
+		// Add new editors via _trackEditorInstance (registers full listeners)
+		const added: any[] = [];
+		for (const [, editor] of currentEditors) {
+			if (this._trackEditorInstance(editor)) {
+				added.push(getEditorState(editor));
+			}
+		}
+		// Determine active editor
+		let newActive: string | null = null;
+		for (const editor of this.codeEditorService.listCodeEditors()) {
+			if (editor.hasTextFocus()) {
+				const model = editor.getModel();
+				if (model && isSyncedModelScheme(model.uri.scheme)) {
+					newActive = `${editor.getId()},${model.id ?? 'null'}`;
+				}
+				break;
+			}
+		}
+		if (!newActive) {
+			const activeControl = this.editorService.activeTextEditorControl;
+			if (activeControl && 'getId' in activeControl) {
+				const model = (activeControl as any).getModel?.() as ITextModel | null;
+				if (model && isSyncedModelScheme(model.uri.scheme)) {
+					newActive = `${(activeControl as any).getId()},${model.id ?? 'null'}`;
+				}
+			}
+		}
+		this._activeTrackedEditorId = newActive;
+		const delta: any = {};
+		if (removed.length) { delta.removedEditors = removed; }
+		if (added.length) { delta.addedEditors = added; }
+		if (newActive !== null) { delta.newActiveEditor = newActive; }
+		if (Object.keys(delta).length > 0) {
+			this._send({ id: this._nextId(), type: 'editorsDelta', params: delta });
+		}
+	}
+
 
 	private static readonly _DIAG_OWNER = 'tauriExtHost';
 
@@ -2497,7 +2821,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	}
 
 
-	private _activeWatches = new Map<number, number>(); // watcherId → Tauri watch_id
+	private _activeWatches = new Map<number, number>(); // watcherId -> Tauri watch_id
 	private _tauriWatchUnlisten: (() => void) | undefined;
 
 	private async _onStartFileWatch(watcherId: number, paths: string[], pattern: string, recursive: boolean): Promise<void> {

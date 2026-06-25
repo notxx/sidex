@@ -392,7 +392,7 @@ pub fn resolve_node_runtime(app: &AppHandle) -> Result<ResolvedNode, String> {
         }
     }
 
-    Err("Node runtime not found. Bundle Node with SideX or install Node.js (>=18).".into())
+    Err("ERR_NODE_MISSING: Node runtime not found. Bundle Node with SideX or install Node.js (>=18).".into())
 }
 
 fn extension_source(app: &AppHandle, path: &Path) -> (String, bool) {
@@ -619,9 +619,9 @@ pub fn scan_extensions(app: &AppHandle, paths: &[PathBuf]) -> Vec<ExtensionManif
 }
 
 /// Build the VS Code-compatible extension descriptions from Rust-scanned manifests.
-/// Only includes Node extensions — WASM extensions are loaded directly by the runtime.
+/// Only includes Node extensions. WASM extensions are loaded directly by the runtime.
 ///
-/// NOTE: WASM extensions are additive — they do NOT suppress Node equivalents yet.
+/// NOTE: WASM extensions are additive. They do NOT suppress Node equivalents yet.
 /// The WASM implementations provide basic static completions while the Node
 /// extensions talk to real language servers (tsserver, css-languageservice, etc.).
 /// Once the WASM extensions reach feature parity, re-enable suppression.
@@ -802,6 +802,7 @@ pub async fn extension_platform_bootstrap(
         .collect();
 
     Ok(serde_json::json!({
+                "sessionId": supervisor.snapshot()?.session_id.unwrap_or_default(),
         "transport": { "kind": "websocket", "endpoint": format!("ws://127.0.0.1:{port}/") },
         "runtime": { "path": node.path, "version": node.version, "source": "system", "bundled": false },
         "paths": {
@@ -833,6 +834,8 @@ pub async fn extension_platform_status(
         "extensionCount": ext_count,
         "restartCount": snapshot.restart_count,
         "totalCrashes": snapshot.total_crashes,
+        "lifecycleState": snapshot.lifecycle_state,
+        "crashLoopDetected": snapshot.crash_loop_detected,
     }))
 }
 
@@ -859,6 +862,60 @@ pub async fn extension_platform_stop(
     supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
 ) -> Result<(), String> {
     supervisor.stop()
+}
+
+#[tauri::command]
+pub async fn extension_platform_report_ws_connected(
+    session_id: String,
+    supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
+) -> Result<(), String> {
+    supervisor.on_ws_connected(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn extension_platform_report_host_ready(
+    session_id: String,
+    supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
+) -> Result<(), String> {
+    supervisor.on_host_ready(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn extension_platform_report_ws_closed(
+    session_id: String,
+    supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
+) -> Result<(), String> {
+    supervisor.on_ws_closed(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn extension_platform_report_host_ready_timeout(
+    session_id: String,
+    supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
+) -> Result<(), String> {
+    supervisor.on_host_ready_timeout(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn extension_platform_report_host_exited(
+    session_id: String,
+    supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
+) -> Result<(), String> {
+    supervisor.on_host_exited(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn extension_platform_report_activation_failed(
+    session_id: String,
+    supervisor: tauri::State<'_, crate::commands::ext_host::ExtensionPlatformSupervisor>,
+) -> Result<(), String> {
+    supervisor.on_activation_failed(&session_id);
+    Ok(())
 }
 
 #[tauri::command]

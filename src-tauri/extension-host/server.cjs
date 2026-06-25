@@ -8,7 +8,7 @@ const os = require('os');
 const crypto = require('crypto');
 const cp = require('child_process');
 
-// ── RFC 6455 WebSocket helpers (zero dependencies) ──────────────────────
+// RFC 6455 WebSocket helpers (zero dependencies)
 
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -82,7 +82,7 @@ function encodeFrame(opcode, data) {
   return Buffer.concat([header, payload]);
 }
 
-// ── Constants (from Rust via env vars) ──────────────────────────────────
+// Constants (from Rust via env vars)
 
 const SIDEX_DATA_DIR = path.join(os.homedir(), '.sidex');
 const EXTENSIONS_DIR = process.env.SIDEX_EXTENSIONS_DIR || path.join(SIDEX_DATA_DIR, 'extensions');
@@ -99,7 +99,7 @@ const GLOBAL_STORAGE_DIR = process.env.SIDEX_GLOBAL_STORAGE_DIR || path.join(USE
   }
 });
 
-// ── Init data: prefer Rust-provided, fallback to self-built ─────────────
+// Init data: prefer Rust-provided, fallback to self-built
 
 let rustInitData = null;
 try {
@@ -113,10 +113,10 @@ try {
     log(`received Rust-generated init data with ${(rustInitData.extensions || []).length} extensions`);
   }
 } catch (e) {
-  log(`failed to parse init data: ${e.message}`);
+  log(`[ext-host/server] failed to parse init data: ${e.message} (session=${process.env.SIDEX_SESSION_ID || 'unknown'})`);
 }
 
-// ── Extension search paths (from Rust) ──────────────────────────────────
+// Extension search paths (from Rust)
 
 function getExtensionSearchPaths() {
   if (process.env.SIDEX_EXTENSION_SEARCH_PATHS) {
@@ -156,13 +156,40 @@ function getExtensionSearchPaths() {
   return paths;
 }
 
-// ── Extension Host Process Management ───────────────────────────────────
+// Extension Host Process Management
 
 class ExtensionHostManager {
   constructor() {
     this._sharedEntry = null;
     this._connectionToken = crypto.randomUUID();
     this._listeners = new Set();
+    this._hostReady = false;
+    this._connectedClients = new Set();
+    this._cachedHostReadyPayload = null;
+  }
+
+  get hostReady() { return this._hostReady; }
+
+  setHostReady(v) { this._hostReady = v; }
+
+  getCachedHostReadyPayload() { return this._cachedHostReadyPayload; }
+
+  registerClient(c) { this._connectedClients.add(c); }
+
+  unregisterClient(c) { this._connectedClients.delete(c); }
+
+  notifyHostExited(code, signal) {
+    const msg = JSON.stringify({ type: 'sidex:host-exited', code: code, signal: signal });
+    for (const client of this._connectedClients) {
+      try {
+        client.failPendingRequests('HostExited', 'Extension host process exited');
+        client._sendJsonRaw(msg);
+        // Close socket so frontend onclose fires and triggers reconnect
+        try { client._socket.end(); } catch {}
+        client._dispose();
+      } catch {}
+    }
+    this._connectedClients.clear();
   }
 
   get connectionToken() {
@@ -173,6 +200,10 @@ class ExtensionHostManager {
     if (this._sharedEntry && this._sharedEntry.child.connected) {
       return this._sharedEntry;
     }
+
+    // Reset cached hostReady when spawning a new process
+    this._cachedHostReadyPayload = null;
+    this._hostReady = false;
 
     const reconnectionToken = crypto.randomUUID();
     const initDataFile = path.join(os.tmpdir(), `sidex-host-${reconnectionToken}.json`);
@@ -196,8 +227,13 @@ class ExtensionHostManager {
     const entry = { child, reconnectionToken, initData };
     this._sharedEntry = entry;
 
+    const exitHandler = (code, signal) => {
+      hostManager.setHostReady(false);
+      hostManager.notifyHostExited(code, signal);
+    };
     child.on('exit', (code, signal) => {
-      log(`ext-host process <${child.pid}> exited: code=${code} signal=${signal}`);
+      log(`[ext-host/host] ext-host process <${child.pid}> exited: code=${code} signal=${signal} (session=${process.env.SIDEX_SESSION_ID || 'unknown'})`);
+      exitHandler(code, signal);
       if (this._sharedEntry === entry) {
         this._sharedEntry = null;
       }
@@ -211,6 +247,12 @@ class ExtensionHostManager {
     });
 
     child.on('message', (msg) => {
+      // Intercept sidex:host-ready at manager level: cache and broadcast
+      if (msg && msg.type === 'sidex:host-ready') {
+        hostManager._cachedHostReadyPayload = msg;
+        hostManager.setHostReady(true);
+        log('[ext-host/host] host-ready cached and broadcast (session=' + (process.env.SIDEX_SESSION_ID || 'unknown') + ')');
+      }
       for (const listener of this._listeners) {
         try {
           listener(msg);
@@ -227,7 +269,7 @@ class ExtensionHostManager {
       child.stderr.on('data', (d) => log(`<${child.pid}><stderr> ${d.trimEnd()}`));
     }
 
-    log(`spawned shared ext-host process <${child.pid}>`);
+    log(`[ext-host/host] spawned shared ext-host process <${child.pid}> (session=${process.env.SIDEX_SESSION_ID || 'unknown'})`);
     return entry;
   }
 
@@ -258,7 +300,7 @@ class ExtensionHostManager {
   }
 }
 
-// ── WebSocket Connection Handler ────────────────────────────────────────
+// WebSocket Connection Handler
 
 const hostManager = new ExtensionHostManager();
 
@@ -294,10 +336,14 @@ class ClientConnection {
     this._disposed = false;
     this._messageListener = null;
     this._pendingClientIds = new Set();
+    this._hostReadyReceived = false;
+    this._hostReadyTimer = null;
+    this._pendingHandshakeData = null;
   }
 
   start() {
-    log('client connected');
+    log('[ext-host/ws] client connected (session=' + (process.env.SIDEX_SESSION_ID || 'unknown') + ')');
+    hostManager.registerClient(this);
 
     this._socket.on('data', (chunk) => this._onData(chunk));
     this._socket.on('close', () => this._onClose());
@@ -310,23 +356,108 @@ class ClientConnection {
   }
 
   _performHandshake() {
+    const sessionId = process.env.SIDEX_SESSION_ID || 'unknown';
+
+    // If host is already ready from a previous connection, send handshake immediately
+    if (hostManager.hostReady) {
+      log('[ext-host/server] host already ready, sending handshake immediately (session=' + sessionId + ')');
+      // Register IPC listener BEFORE sending handshake so replies are routed
+      this._setupIPC();
+      // Build pendingHandshakeData first so _sendReadyHandshake can use it
+      const initData = rustInitData || this._buildFallbackInitData();
+      const extensions = initData.extensions || [];
+      const reconnectionToken = crypto.randomUUID();
+      const connectionToken = hostManager.connectionToken;
+      this._pendingHandshakeData = {
+        initData: initData,
+        extensions: extensions,
+        connectionToken: connectionToken,
+        reconnectionToken: reconnectionToken,
+        extensionCount: extensions.length,
+        sessionId: sessionId,
+      };
+      // Use cached host-ready payload if available; otherwise send handshake directly
+      const cached = hostManager.getCachedHostReadyPayload();
+      if (cached) {
+        log('[ext-host/server] using cached host-ready payload (session=' + sessionId + ')');
+        this._hostReadyReceived = true;
+      }
+      this._sendReadyHandshake(cached ? cached.extensionCount : extensions.length);
+      log('[ext-host/server] handshake sent with hostReady=true (session=' + sessionId + ')');
+      return;
+    }
+
+    this._sendJson({
+      type: 'sidex:server-session',
+      sessionId,
+      serverReady: true,
+    });
+
     const initData = rustInitData || this._buildFallbackInitData();
     const extensions = initData.extensions || [];
+    const extensionCount = extensions.length;
 
-    log(`handshake with ${extensions.length} extensions (source: ${rustInitData ? 'rust' : 'fallback'})`);
+    log('[ext-host/server] init data loaded: ' + extensionCount + ' extensions (session=' + sessionId + ', source=' + (rustInitData ? 'rust' : 'fallback') + ')');
 
     const reconnectionToken = crypto.randomUUID();
     const connectionToken = hostManager.connectionToken;
+    const hostEntry = hostManager.getOrCreateSharedProcess(initData);
+    log('[ext-host/host] host.cjs spawned pid=' + hostEntry.child.pid + ' (session=' + sessionId + ')');
 
-    hostManager.getOrCreateSharedProcess(initData);
     this._setupIPC();
 
+    this._hostReadyTimer = setTimeout(function() {
+      if (!this._hostReadyReceived) {
+        log('[ext-host/host] host-ready timeout after 30s (session=' + sessionId + ')');
+        // Kill the stuck host child process so reconnect does not reuse it
+        if (hostManager._sharedEntry) {
+          try {
+            hostManager._sharedEntry.child.kill();
+            log('[ext-host/host] killed stuck host process pid=' + hostManager._sharedEntry.child.pid + ' (session=' + sessionId + ')');
+          } catch (e) {
+            log('[ext-host/host] error killing stuck host: ' + e.message);
+          }
+          hostManager._sharedEntry = null;
+        }
+        hostManager.setHostReady(false);
+        hostManager._cachedHostReadyPayload = null;
+        this._sendJson({
+          type: 'sidex:handshake',
+          sessionId: sessionId,
+          hostReady: false,
+          hostReadyTimeout: true,
+          extensionCount: extensionCount,
+          extensions: [],
+        });
+        // Close socket to trigger frontend reconnect with incremented retry counter
+        try { this._socket.end(); } catch {}
+      }
+    }.bind(this), 30000);
+
+    this._pendingHandshakeData = {
+      initData: initData,
+      extensions: extensions,
+      connectionToken: connectionToken,
+      reconnectionToken: reconnectionToken,
+      extensionCount: extensionCount,
+      sessionId: sessionId,
+    };
+  }
+
+  _sendReadyHandshake(extensionCount) {
+    const data = this._pendingHandshakeData;
+    if (!data) {
+      log('[ext-host/server] _sendReadyHandshake: no pending handshake data, skipping');
+      return;
+    }
     this._sendJson({
       type: 'sidex:handshake',
-      connectionToken,
-      reconnectionToken,
-      extensionCount: extensions.length,
-      extensions: extensions.map((e) => ({
+      sessionId: data.sessionId,
+      hostReady: true,
+      connectionToken: data.connectionToken,
+      reconnectionToken: data.reconnectionToken,
+      extensionCount: extensionCount,
+      extensions: data.extensions.map(function(e) { return {
         id: e.identifier?.id || e.id || 'unknown',
         location: e.extensionLocation?.path || e.location?.path || '',
         name: e.packageJSON?.displayName || e.packageJSON?.name || e.identifier?.id || '',
@@ -335,10 +466,26 @@ class ClientConnection {
         main: e.packageJSON?.main,
         browser: e.packageJSON?.browser,
         contributes: Object.keys(e.packageJSON?.contributes || {}),
-      })),
+      };}),
     });
   }
 
+  _onHostReady(msg) {
+    clearTimeout(this._hostReadyTimer);
+    hostManager.setHostReady(true);
+    this._hostReadyReceived = true;
+    const sessionId = process.env.SIDEX_SESSION_ID || 'unknown';
+    const data = this._pendingHandshakeData;
+    if (!data) {
+      log('[ext-host/host] host-ready received but no pending handshake data (session=' + sessionId + ')');
+      return;
+    }
+
+    log('[ext-host/host] host-ready received: ' + (msg.extensionCount || 0) + ' extensions ready (session=' + sessionId + ')');
+
+    this._sendReadyHandshake(msg.extensionCount || data.extensionCount);
+    log('[ext-host/host] handshake sent with hostReady=true (session=' + sessionId + ')');
+  }
   _buildFallbackInitData() {
     const searchPaths = getExtensionSearchPaths();
     const extensions = scanExtensionsFallback(searchPaths);
@@ -382,6 +529,11 @@ class ClientConnection {
   _setupIPC() {
     this._messageListener = (msg) => {
       if (msg && msg.type === 'VSCODE_EXTHOST_IPC_READY') {
+        return;
+      }
+
+      if (msg && msg.type === 'sidex:host-ready') {
+        this._onHostReady(msg);
         return;
       }
 
@@ -444,10 +596,11 @@ class ClientConnection {
       return;
     }
 
-    const { id, type, method, params } = msg;
-    const handler = type || method;
+    const id = msg.id;
+    const method = msg.type || msg.method || '';
+    const params = msg.params;
 
-    switch (handler) {
+    switch (method) {
       case 'ping':
         this._sendJson({ id, type: 'pong' });
         break;
@@ -457,6 +610,14 @@ class ClientConnection {
         break;
 
       default:
+        // Before hostReady, only allow initialize and ping; reject everything else
+        if (!hostManager.hostReady && !this._hostReadyReceived) {
+          log('[ext-host/protocol] rejecting request before hostReady: ' + method + ' (session=' + (process.env.SIDEX_SESSION_ID || 'unknown') + ')');
+          if (id !== undefined) {
+            this._sendJson({ id: id, error: { code: 'HostNotReady', message: 'Extension host not ready yet. Wait for sidex:handshake with hostReady=true.' } });
+          }
+          return;
+        }
         this._forwardToExtHost(id, msg);
         break;
     }
@@ -523,8 +684,29 @@ class ClientConnection {
     }
   }
 
+  _sendJsonRaw(jsonStr) {
+    if (this._disposed) {
+      return;
+    }
+    try {
+      this._socket.write(encodeFrame(0x01, jsonStr));
+    } catch {
+      // best-effort
+    }
+  }
+
+  failPendingRequests(code, message) {
+    for (const clientId of this._pendingClientIds) {
+      this._sendJson({ id: clientId, error: { code: code, message: message } });
+    }
+    this._pendingClientIds.clear();
+  }
+
   _onClose() {
-    log('client disconnected');
+    log('[ext-host/ws] client disconnected (session=' + (process.env.SIDEX_SESSION_ID || 'unknown') + ')');
+    clearTimeout(this._hostReadyTimer);
+    this._hostReadyTimer = null;
+    hostManager.unregisterClient(this);
     this._dispose();
   }
 
@@ -533,6 +715,8 @@ class ClientConnection {
       return;
     }
     this._disposed = true;
+    clearTimeout(this._hostReadyTimer);
+    this._hostReadyTimer = null;
     if (this._messageListener) {
       hostManager.removeMessageListener(this._messageListener);
       this._messageListener = null;
@@ -541,7 +725,7 @@ class ClientConnection {
   }
 }
 
-// ── Fallback extension scanner (only used when Rust init data unavailable)
+// Fallback extension scanner (only used when Rust init data unavailable)
 
 function scanExtensionsFallback(searchPaths) {
   const disableIds = new Set(
@@ -631,7 +815,7 @@ function scanExtensionsFallback(searchPaths) {
   return [...byId.values()];
 }
 
-// ── HTTP Server ─────────────────────────────────────────────────────────
+// HTTP Server
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -669,7 +853,7 @@ async function main() {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    process.stdout.write(JSON.stringify({ port }) + '\n');
+    process.stdout.write('SIDEX_EXT_HOST_PORT ' + JSON.stringify({ type: 'sidex:server-port', sessionId: process.env.SIDEX_SESSION_ID || 'unknown', port }) + '\n');
     log(`listening on 127.0.0.1:${port} (session=${process.env.SIDEX_SESSION_ID || 'unknown'})`);
   });
 

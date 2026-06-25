@@ -26,6 +26,28 @@ function navigateToFolder(folderUri: string) {
 }
 
 async function boot() {
+	// Storage diagnostics (dev only): gated behind URL param sidexDev=1.
+	// Prints localStorage key count and IndexedDB database names to diagnose
+	// VS Code storage contamination. Disabled by default.
+	const isDevDiag = new URLSearchParams(window.location.search).get('sidexDev') === '1';
+	if (isDevDiag) {
+		try {
+			const lsKeyCount = localStorage.length;
+			console.log('[SideX Probe] localStorage key count:', lsKeyCount);
+
+			const idbInfo: Array<{ name: string; version: number }> = [];
+			if ('databases' in indexedDB) {
+				const dbs = await indexedDB.databases();
+				for (const db of dbs) {
+					idbInfo.push({ name: db.name ?? '(unnamed)', version: db.version ?? 0 });
+				}
+			}
+			console.log('[SideX Probe] IndexedDB databases:', idbInfo.length, idbInfo);
+		} catch (e) {
+			console.error('[SideX Probe] Storage probe failed:', e);
+		}
+	}
+
 	// Load locale translations before any VS Code module imports
 	await loadNlsMessages();
 
