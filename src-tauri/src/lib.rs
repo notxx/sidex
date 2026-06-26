@@ -45,6 +45,8 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .item(&MenuItemBuilder::with_id("open_folder", "Open Folder...").build(app)?)
         .item(&MenuItemBuilder::with_id("open_recent", "Open Recent").build(app)?)
         .separator()
+        .item(&MenuItemBuilder::with_id("close_folder", "Close Folder").build(app)?)
+        .separator()
         .item(
             &MenuItemBuilder::with_id("save", "Save")
                 .accelerator("CmdOrCtrl+S")

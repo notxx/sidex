@@ -1430,27 +1430,34 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 	}
 
 	private async openViewContainer(location: ViewContainerLocation, id: string, focus?: boolean): Promise<void> {
-		let viewContainer = await this.paneCompositeService.openPaneComposite(id, location, focus);
-		if (viewContainer) {
+		if (await this.tryOpenRegisteredViewContainer(location, id, focus)) {
 			return;
 		}
 
 		// fallback to default view container
-		viewContainer = await this.paneCompositeService.openPaneComposite(
-			this.viewDescriptorService.getDefaultViewContainer(location)?.id,
-			location,
-			focus
-		);
-		if (viewContainer) {
+		const defaultId = this.viewDescriptorService.getDefaultViewContainer(location)?.id;
+		if (await this.tryOpenRegisteredViewContainer(location, defaultId, focus)) {
 			return;
 		}
 
 		// finally try to just open the first visible view container
-		await this.paneCompositeService.openPaneComposite(
-			this.paneCompositeService.getVisiblePaneCompositeIds(location).at(0),
-			location,
-			focus
-		);
+		for (const visibleId of this.paneCompositeService.getVisiblePaneCompositeIds(location)) {
+			if (await this.tryOpenRegisteredViewContainer(location, visibleId, focus)) {
+				return;
+			}
+		}
+	}
+
+	private async tryOpenRegisteredViewContainer(location: ViewContainerLocation, id: string | undefined, focus?: boolean): Promise<boolean> {
+		if (!id) {
+			return false;
+		}
+		if (!this.paneCompositeService.getPaneComposite(id, location)) {
+			this.logService.info(`[Workbench/layout] skipping unregistered view container during restore: ${id}`);
+			return false;
+		}
+		const viewContainer = await this.paneCompositeService.openPaneComposite(id, location, focus);
+		return Boolean(viewContainer);
 	}
 
 	registerPart(part: Part): IDisposable {

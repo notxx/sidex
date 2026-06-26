@@ -226,6 +226,8 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 				this._removeUninstalledExtension(event);
 			}
 		}));
+		this._register(this.workspaceContextService.onDidChangeWorkbenchState(() => this._syncWorkspaceFolders()));
+		this._register(this.workspaceContextService.onDidChangeWorkspaceFolders(() => this._syncWorkspaceFolders()));
 		try {
 			const bootstrap = await bootstrapExtensionPlatform();
 			this._applyBootstrap(bootstrap);
@@ -298,15 +300,8 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 			}).catch(() => {});
 		}
 
-		const workspaceFolders = this.workspaceContextService
-			.getWorkspace()
-			.folders
-			.map(folder => folder.uri)
-			.filter(uri => uri.scheme === 'file')
-			.map(uri => uri.fsPath);
-		if (workspaceFolders.length > 0) {
-			wasmSyncWorkspaceFolders(workspaceFolders).catch(() => {});
-		}
+		const workspaceFolders = this._getWorkspaceFolders();
+		wasmSyncWorkspaceFolders(workspaceFolders).catch(() => {});
 
 		this._syncDocumentsToWasm();
 	}
@@ -551,13 +546,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 				this._hostReady = false;
 				this._reconnectAttempts = 0;
 				// ws_connected reported after server-session (when sessionId is known)
-				const workspaceFolders = this.workspaceContextService
-					.getWorkspace()
-					.folders
-					.map(folder => folder.uri)
-					.filter(uri => uri.scheme === 'file')
-					.map(uri => uri.fsPath);
-				this._send({ id: this._nextId(), type: 'initialize', params: { extensionPaths: [], workspaceFolders } });
+				this._sendInitialize();
 				this._syncOpenDocuments();
 				this._syncActiveEditor();
 				this._startEditorTracking();
@@ -674,6 +663,34 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	private _send(msg: Record<string, unknown>): void {
 		if (this._ws?.readyState === WebSocket.OPEN) {
 			this._ws.send(JSON.stringify(msg));
+		}
+	}
+
+	private _getWorkspaceFolders(): string[] {
+		return this.workspaceContextService
+			.getWorkspace()
+			.folders
+			.map(folder => folder.uri)
+			.filter(uri => uri.scheme === 'file')
+			.map(uri => uri.fsPath);
+	}
+
+	private _sendInitialize(): void {
+		const workspaceFolders = this._getWorkspaceFolders();
+		this._send({ id: this._nextId(), type: 'initialize', params: { extensionPaths: [], workspaceFolders } });
+	}
+
+	private _syncWorkspaceFolders(): void {
+		const workspaceFolders = this._getWorkspaceFolders();
+		wasmSyncWorkspaceFolders(workspaceFolders).catch(() => {});
+		if (!this._connected || this._ws?.readyState !== WebSocket.OPEN) {
+			return;
+		}
+		this._sendInitialize();
+		if (this._hostReady) {
+			this._syncOpenDocuments();
+			this._sendActiveEditor();
+			this._sendCurrentEditorsSnapshot();
 		}
 	}
 

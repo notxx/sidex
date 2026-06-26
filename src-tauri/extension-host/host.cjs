@@ -284,11 +284,9 @@ class ExtensionHost extends EventEmitter {
       case 'resetPanels':
         return this._handleResetPanels(id);
       case 'activateByEvent':
-        this._checkActivationEvents(params?.event || '');
-        return { id, result: true };
+        return this._handleActivateByEvent(id, params?.event || '');
       case 'viewOpened':
-        this._checkActivationEvents(`onView:${params?.viewId || ''}`);
-        return { id, result: true };
+        return this._handleActivateByEvent(id, `onView:${params?.viewId || ''}`);
       case 'handleUri':
         this._checkActivationEvents('onUri');
         if (this._uriHandler && typeof this._uriHandler.handleUri === 'function') {
@@ -1158,6 +1156,10 @@ class ExtensionHost extends EventEmitter {
         disposeEmitter.on('dispose', listener);
         return { dispose() { disposeEmitter.removeListener('dispose', listener); } };
       },
+      onDidDispose: (listener) => {
+        disposeEmitter.on('dispose', listener);
+        return { dispose() { disposeEmitter.removeListener('dispose', listener); } };
+      },
       dispose() { disposeEmitter.emit('dispose'); },
       show(preserveFocus) {
         host.emit('event', { type: 'webviewViewShow', webviewHandle, preserveFocus });
@@ -1165,7 +1167,13 @@ class ExtensionHost extends EventEmitter {
     };
 
     if (!this._webviewViews) this._webviewViews = new Map();
-    this._webviewViews.set(webviewHandle, { view: webviewView, messageEmitter, disposeEmitter, visibilityEmitter });
+    this._webviewViews.set(webviewHandle, {
+      view: webviewView,
+      messageEmitter,
+      disposeEmitter,
+      visibilityEmitter,
+      setVisible(visible) { _visible = !!visible; },
+    });
 
     try {
       provider.resolveWebviewView(webviewView, { state: params.state }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
@@ -1183,7 +1191,10 @@ class ExtensionHost extends EventEmitter {
 
   _handleWebviewViewVisible(id, params) {
     const entry = this._webviewViews?.get(params.webviewHandle);
-    if (entry) entry.visibilityEmitter.emit('change', params.visible);
+    if (entry) {
+      entry.setVisible?.(params.visible);
+      entry.visibilityEmitter.emit('change', params.visible);
+    }
     return { id, result: true };
   }
 
@@ -1549,13 +1560,26 @@ class ExtensionHost extends EventEmitter {
   }
 
   _checkActivationEvents(event) {
+    const activations = [];
     for (const [extId, ext] of this._extensions) {
       if (ext.activated) continue;
       const events = ext.manifest.activationEvents || [];
-      if (events.includes(event) || events.includes('*') || events.includes('onStartupFinished')) {
-        this._activateExtension(extId).catch((e) => log(`activation error (${extId}): ${e.message}`));
+      if (events.includes(event) || (event === '*' && events.includes('*'))) {
+        const activation = this._activateExtension(extId).catch((e) => {
+          log(`activation error (${extId}): ${e.message}`);
+        });
+        activations.push(activation);
       }
     }
+    return activations;
+  }
+
+  async _handleActivateByEvent(id, event) {
+    const activations = this._checkActivationEvents(event);
+    if (activations.length > 0) {
+      await Promise.allSettled(activations);
+    }
+    return { id, result: true };
   }
 
   _readManifest(extensionPath) {

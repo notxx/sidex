@@ -25,6 +25,15 @@ function navigateToFolder(folderUri: string) {
 	window.location.href = url.toString();
 }
 
+function navigateToEmptyWindow() {
+	const url = new URL(window.location.href);
+	if (!url.searchParams.has('folder')) {
+		return;
+	}
+	url.searchParams.delete('folder');
+	window.location.href = url.toString();
+}
+
 async function boot() {
 	// Storage diagnostics (dev only): gated behind URL param sidexDev=1.
 	// Prints localStorage key count and IndexedDB database names to diagnose
@@ -129,6 +138,10 @@ async function boot() {
 			workspace,
 			trusted: true,
 			open: async (_workspace: any, _options: any) => {
+				if (!_workspace) {
+					navigateToEmptyWindow();
+					return true;
+				}
 				// When VSCode asks to open a new workspace, reload with the folder param
 				if (_workspace && 'folderUri' in _workspace) {
 					navigateToFolder(_workspace.folderUri.toString());
@@ -352,6 +365,7 @@ function setupMenuActions() {
 		save_as: 'workbench.action.files.saveAs',
 		save_all: 'workbench.action.files.saveAll',
 		close_editor: 'workbench.action.closeActiveEditor',
+		close_folder: 'workbench.action.closeFolder',
 		close_window: 'workbench.action.closeWindow',
 		// Edit
 		find: 'actions.find',
@@ -411,6 +425,10 @@ function setupMenuActions() {
 			sidexOpenFolder();
 			return;
 		}
+		if (menuId === 'close_folder') {
+			navigateToEmptyWindow();
+			return;
+		}
 
 		if (menuId === 'find') {
 			const editorService = (window as any).__sidex_editorService;
@@ -454,6 +472,10 @@ function setupMenuActions() {
 			commandId === 'workbench.action.files.openFolderViaWorkspace'
 		) {
 			sidexOpenFolder();
+			return;
+		}
+		if (commandId === 'workbench.action.closeFolder') {
+			navigateToEmptyWindow();
 			return;
 		}
 		try {
@@ -501,6 +523,7 @@ async function updateNativeMenuLabels() {
 		miNewFile: 'new_file',
 		miNewWindow: 'new_window',
 		miOpenFile: 'open_file',
+		miCloseFolder: 'close_folder',
 		miSave: 'save',
 		miSaveAs: 'save_as',
 		miCloseEditor: 'close_editor',
