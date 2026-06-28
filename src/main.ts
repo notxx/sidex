@@ -34,6 +34,50 @@ function navigateToEmptyWindow() {
 	window.location.href = url.toString();
 }
 
+function delay(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isDynamicImportFetchError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		message.includes('Failed to fetch dynamically imported module') ||
+		message.includes('Importing a module script failed') ||
+		message.includes('error loading dynamically imported module')
+	);
+}
+
+function devRetryUrl(specifier: string, attempt: number): string {
+	const url = new URL(specifier, import.meta.url);
+	url.searchParams.set('sidexRetry', String(attempt));
+	return url.href;
+}
+
+async function importStartupModule(
+	label: string,
+	importer: () => Promise<unknown>,
+	devSpecifier: string
+): Promise<void> {
+	const maxAttempts = import.meta.env.DEV ? 3 : 1;
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			if (attempt === 1) {
+				await importer();
+			} else {
+				await import(/* @vite-ignore */ devRetryUrl(devSpecifier, attempt));
+			}
+			return;
+		} catch (e) {
+			if (attempt >= maxAttempts || !isDynamicImportFetchError(e)) {
+				console.error(`[SideX] Barrel "${label}" failed:`, e);
+				throw e;
+			}
+			console.warn(`[SideX] Barrel "${label}" failed, retrying:`, e);
+			await delay(250 * attempt);
+		}
+	}
+}
+
 async function boot() {
 	// Storage diagnostics (dev only): gated behind URL param sidexDev=1.
 	// Prints localStorage key count and IndexedDB database names to diagnose
@@ -61,22 +105,26 @@ async function boot() {
 	await loadNlsMessages();
 
 	await Promise.all([
-		import('./vs/workbench/workbench.common.main.js').catch(e => {
-			console.error('[SideX] Barrel "common" failed:', e);
-			throw e;
-		}),
-		import('./vs/workbench/browser/web.main.js').catch(e => {
-			console.error('[SideX] Barrel "web.main" failed:', e);
-			throw e;
-		}),
-		import('./vs/workbench/browser/parts/dialogs/dialog.web.contribution.js').catch(e => {
-			console.error('[SideX] Barrel "web-dialog" failed:', e);
-			throw e;
-		}),
-		import('./vs/workbench/workbench.web.main.js').catch(e => {
-			console.error('[SideX] Barrel "web-services" failed:', e);
-			throw e;
-		})
+		importStartupModule(
+			'common',
+			() => import('./vs/workbench/workbench.common.main.js'),
+			'./vs/workbench/workbench.common.main.js'
+		),
+		importStartupModule(
+			'web.main',
+			() => import('./vs/workbench/browser/web.main.js'),
+			'./vs/workbench/browser/web.main.js'
+		),
+		importStartupModule(
+			'web-dialog',
+			() => import('./vs/workbench/browser/parts/dialogs/dialog.web.contribution.js'),
+			'./vs/workbench/browser/parts/dialogs/dialog.web.contribution.js'
+		),
+		importStartupModule(
+			'web-services',
+			() => import('./vs/workbench/workbench.web.main.js'),
+			'./vs/workbench/workbench.web.main.js'
+		)
 	]);
 
 	// SideX Rust bridge initialization — make services available before workbench creation
