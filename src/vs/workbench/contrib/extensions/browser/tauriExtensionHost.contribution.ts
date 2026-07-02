@@ -60,6 +60,10 @@ import {
 	wasmProvideDefinitionAll,
 	wasmProvideDocumentSymbolsAll,
 	wasmProvideFormattingAll,
+	wasmGetExtensionMetadata,
+	wasmGetTreeChildren,
+	wasmOnTreeItemActivated,
+	wasmExecuteCommandAll,
 	type IExtensionPlatformBootstrap,
 	type IExtensionManifestSummary,
 } from './extensionPlatformClient.js';
@@ -75,12 +79,13 @@ import { IWebviewWorkbenchService } from '../../webviewPanel/browser/webviewWork
 import type { WebviewInput } from '../../webviewPanel/browser/webviewEditorInput.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
-import { Extensions as ViewExtensions, type IViewsRegistry, type ITreeViewDescriptor, type ITreeViewDataProvider as _ITreeViewDataProvider, type ITreeItem as _ITreeItem } from '../../../common/views.js';
+import { Extensions as ViewExtensions, type IViewsRegistry, type IViewContainersRegistry, type ITreeViewDescriptor, type ITreeViewDataProvider as _ITreeViewDataProvider, type ITreeItem as _ITreeItem } from '../../../common/views.js';
 import { TreeView, TreeViewPane } from '../../../browser/parts/views/treeView.js';
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
 import { IWorkbenchExtensionManagementService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import type { DidUninstallExtensionEvent, InstallExtensionResult, IGalleryExtension } from '../../../../platform/extensionManagement/common/extensionManagement.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
+import { MenuRegistry } from '../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IWebviewViewService } from '../../webviewView/browser/webviewViewService.js';
 import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
@@ -296,7 +301,10 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 			listen<number>('sidex-wasm-extensions-ready', () => {
 				this.logService.info('[ExtHost] WASM extensions ready');
 				this._syncDocumentsToWasm();
-				setTimeout(() => this._registerWasmProviders(), 200);
+				setTimeout(() => {
+					this._registerWasmProviders();
+					this._registerWasmViewsAndCommands(wasmExtensions);
+				}, 200);
 			}).catch(() => {});
 		}
 
@@ -531,6 +539,90 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		);
 
 		this.logService.info(`[ExtHost] WASM providers registered for: ${(wasmLanguages as string[]).join(', ')}`);
+	}
+
+	private async _registerWasmViewsAndCommands(wasmExtensions: IExtensionManifestSummary[]): Promise<void> {
+		const viewsRegistry = Registry.as<IViewsRegistry>(ViewExtensions.ViewsRegistry);
+		const viewContainersRegistry = Registry.as<IViewContainersRegistry>(ViewExtensions.ViewContainersRegistry);
+		for (const ext of wasmExtensions) {
+			try {
+				const meta = await wasmGetExtensionMetadata(ext.id);
+				this.logService.info(`[ExtHost] WASM metadata for ${ext.id}: ${meta.commands?.length ?? 0} commands, ${meta.viewIds?.length ?? 0} views`);
+
+				// Register commands to Command Palette
+				if (meta.commands) {
+					for (const cmd of meta.commands) {
+						if (!CommandsRegistry.getCommand(cmd.id)) {
+							// Register handler
+							const disposable = CommandsRegistry.registerCommand({
+								id: cmd.id,
+								handler: (_accessor, ...args: any[]) => {
+									this.logService.info(`[ExtHost] WASM CMD INVOKE: ${cmd.id}`);
+									return wasmExecuteCommandAll(cmd.id, JSON.stringify(args));
+								},
+								metadata: cmd.title ? { description: cmd.title } : undefined,
+							});
+							this._wasmProviderRegistrations.push(disposable);
+							// Register in Command Palette (MenuRegistry required for palette visibility)
+							if (cmd.title) {
+								const cmdDisposable = MenuRegistry.addCommand({
+									id: cmd.id,
+									title: { value: cmd.title, original: cmd.title },
+								});
+								this._wasmProviderRegistrations.push(cmdDisposable);
+							}
+							this.logService.info(`[ExtHost] Registered WASM command: ${cmd.id} (${cmd.title})`);
+						}
+					}
+				}
+
+				// Register tree views
+				if (meta.viewIds) {
+					for (const viewId of meta.viewIds) {
+						const existing = viewsRegistry.getView(viewId) as ITreeViewDescriptor | null;
+						if (existing?.treeView) {
+							continue;
+						}
+						try {
+							const treeView = this.instantiationService.createInstance(TreeView, viewId, viewId);
+							const explorerContainer = viewContainersRegistry.get('workbench.view.explorer');
+							if (!explorerContainer) {
+								this.logService.warn(`[ExtHost] Explorer container not found, skipping view ${viewId}`);
+								continue;
+							}
+							viewsRegistry.registerViews([{
+								id: viewId,
+								name: { value: meta.displayName || viewId, original: meta.displayName || viewId },
+								ctorDescriptor: new SyncDescriptor(TreeViewPane),
+								treeView,
+								canToggleVisibility: true,
+								collapsed: true,
+							} as ITreeViewDescriptor], explorerContainer);
+							// Set WASM-backed data provider
+							treeView.dataProvider = {
+								getChildren: async (element) => {
+									const elementId = element ? (element as any).handle : null;
+									const items = await wasmGetTreeChildren(ext.id, viewId, elementId);
+									return items.map((item: any) => ({
+										handle: item.id,
+										collapsibleState: item.collapsibleState ?? 0,
+										label: { label: item.label, matches: [] },
+										tooltip: item.tooltip ?? undefined,
+										icon: item.icon ?? undefined,
+									}));
+								},
+							};
+							this._treeViews.set(viewId, treeView);
+							this.logService.info(`[ExtHost] Registered WASM tree view: ${viewId}`);
+						} catch (e) {
+							this.logService.warn(`[ExtHost] Failed to register WASM tree view ${viewId}:`, e);
+						}
+					}
+				}
+			} catch (e) {
+				this.logService.warn(`[ExtHost] Failed to register WASM views/commands for ${ext.id}:`, e);
+			}
+		}
 	}
 
 	private _connect(endpoint: string): void {

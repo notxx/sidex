@@ -3398,6 +3398,103 @@ pub async fn wasm_execute_command_all(
 }
 
 #[tauri::command]
+pub async fn wasm_get_tree_children(
+    extension_id: String,
+    view_id: String,
+    element_id: Option<String>,
+    state: State<'_, Arc<WasmExtensionRuntime>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+    let ext = guard
+        .extensions
+        .get_mut(&extension_id)
+        .ok_or_else(|| format!("extension not loaded: {extension_id}"))?;
+    let items = ext
+        .bindings
+        .sidex_extension_extension_api()
+        .call_get_tree_children(&mut ext.store, &view_id, element_id.as_deref())
+        .map_err(|e| format!("get_tree_children failed: {e}"))?;
+    Ok(items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "label": item.label,
+                "tooltip": item.tooltip,
+                "icon": item.icon,
+                "collapsibleState": item.collapsible_state,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn wasm_get_tree_item(
+    extension_id: String,
+    view_id: String,
+    element_id: String,
+    state: State<'_, Arc<WasmExtensionRuntime>>,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+    let ext = guard
+        .extensions
+        .get_mut(&extension_id)
+        .ok_or_else(|| format!("extension not loaded: {extension_id}"))?;
+    let item = ext
+        .bindings
+        .sidex_extension_extension_api()
+        .call_get_tree_item(&mut ext.store, &view_id, &element_id)
+        .map_err(|e| format!("get_tree_item failed: {e}"))?;
+    Ok(item.map(|item| {
+        serde_json::json!({
+            "id": item.id,
+            "label": item.label,
+            "tooltip": item.tooltip,
+            "icon": item.icon,
+            "collapsibleState": item.collapsible_state,
+        })
+    }))
+}
+
+#[tauri::command]
+pub async fn wasm_on_tree_item_activated(
+    extension_id: String,
+    view_id: String,
+    element_id: String,
+    state: State<'_, Arc<WasmExtensionRuntime>>,
+) -> Result<(), String> {
+    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+    let ext = guard
+        .extensions
+        .get_mut(&extension_id)
+        .ok_or_else(|| format!("extension not loaded: {extension_id}"))?;
+    ext.bindings
+        .sidex_extension_extension_api()
+        .call_on_tree_item_activated(&mut ext.store, &view_id, &element_id)
+        .map_err(|e| format!("on_tree_item_activated failed: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn wasm_on_tree_visibility_changed(
+    extension_id: String,
+    view_id: String,
+    visible: bool,
+    state: State<'_, Arc<WasmExtensionRuntime>>,
+) -> Result<(), String> {
+    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+    let ext = guard
+        .extensions
+        .get_mut(&extension_id)
+        .ok_or_else(|| format!("extension not loaded: {extension_id}"))?;
+    ext.bindings
+        .sidex_extension_extension_api()
+        .call_on_tree_visibility_changed(&mut ext.store, &view_id, visible)
+        .map_err(|e| format!("on_tree_visibility_changed failed: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn wasm_get_extension_metadata(
     extension_id: String,
     state: State<'_, Arc<WasmExtensionRuntime>>,
@@ -3422,6 +3519,7 @@ pub async fn wasm_get_extension_metadata(
     let legend = api
         .call_get_semantic_tokens_legend(&mut ext.store)
         .unwrap_or(None);
+    let view_ids = api.call_get_view_ids(&mut ext.store).unwrap_or_default();
     Ok(serde_json::json!({
         "id": extension_id,
         "name": name,
@@ -3431,6 +3529,7 @@ pub async fn wasm_get_extension_metadata(
         "activationEvents": activation_events,
         "commands": commands.iter().map(|c| serde_json::json!({"id": c.id, "title": c.title})).collect::<Vec<_>>(),
         "languages": languages,
+        "viewIds": view_ids,
         "semanticTokensLegend": legend.map(|l| serde_json::json!({
             "tokenTypes": l.token_types,
             "tokenModifiers": l.token_modifiers,

@@ -1,0 +1,9 @@
+[extension]
+id = "zuan.rust-probe"
+name = "ZuAn Rust Probe"
+version = "0.1.0"
+description = "Probe SideX Rust/WASM extension host capabilities for ZuAn"
+wasm = "dist/zuan_rust_probe.wasm"
+
+[activation]
+events = ["*"]

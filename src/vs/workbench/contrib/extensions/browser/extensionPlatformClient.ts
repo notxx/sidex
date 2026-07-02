@@ -313,3 +313,31 @@ export async function wasmProvideFormattingAll(
 ): Promise<any> {
   return invoke<any>('wasm_provide_formatting_all', { uri, languageId, version, tabSize, insertSpaces });
 }
+
+// ---------------------------------------------------------------------------
+// WASM extension metadata & tree view
+// ---------------------------------------------------------------------------
+
+export async function wasmGetExtensionMetadata(extensionId: string): Promise<any> {
+  return invoke<any>('wasm_get_extension_metadata', { extensionId });
+}
+
+export async function wasmGetTreeChildren(extensionId: string, viewId: string, elementId: string | null): Promise<any[]> {
+  return invoke<any[]>('wasm_get_tree_children', { extensionId, viewId, elementId });
+}
+
+export async function wasmGetTreeItem(extensionId: string, viewId: string, elementId: string): Promise<any> {
+  return invoke<any>('wasm_get_tree_item', { extensionId, viewId, elementId });
+}
+
+export async function wasmOnTreeItemActivated(extensionId: string, viewId: string, elementId: string): Promise<void> {
+  return invoke<void>('wasm_on_tree_item_activated', { extensionId, viewId, elementId });
+}
+
+export async function wasmOnTreeVisibilityChanged(extensionId: string, viewId: string, visible: boolean): Promise<void> {
+  return invoke<void>('wasm_on_tree_visibility_changed', { extensionId, viewId, visible });
+}
+
+export async function wasmExecuteCommandAll(commandId: string, args: string): Promise<any> {
+  return invoke<any>('wasm_execute_command_all', { commandId, args });
+}
