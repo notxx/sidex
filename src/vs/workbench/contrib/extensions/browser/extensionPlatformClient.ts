@@ -43,6 +43,8 @@ export interface IExtensionPlatformBootstrap {
   sessionKind: string;
   extensions: IExtensionManifestSummary[];
   initDataJson: string;
+  nodeAvailable?: boolean;
+  nodeError?: string | null;
 }
 
 export interface IExtensionPlatformStatus {

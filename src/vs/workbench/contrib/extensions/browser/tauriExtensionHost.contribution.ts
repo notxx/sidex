@@ -63,7 +63,9 @@ import {
 	wasmGetExtensionMetadata,
 	wasmGetTreeChildren,
 	wasmOnTreeItemActivated,
+	wasmOnTreeVisibilityChanged,
 	wasmExecuteCommandAll,
+	listWasmExtensions,
 	type IExtensionPlatformBootstrap,
 	type IExtensionManifestSummary,
 } from './extensionPlatformClient.js';
@@ -184,6 +186,21 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	private _registeredCommands = new Map<string, IDisposable>();
 	private _webviewViewDisposables = new Map<string, IDisposable>();
 
+	// WASM ready gate — state machine
+	//   bootstrap → _wasmBootstrapSeen=true → _tryFinalizeWasmRegistration
+	//   ready event → _wasmRuntimeReady=true → _tryFinalizeWasmRegistration
+	//   poll → listWasmExtensions() sees ext → _wasmRuntimeReady=true
+	//   finalize → _wasmRegistered=true → done
+	private _wasmBootstrapSeen = false;
+	private _wasmRuntimeReady = false;
+	private _wasmRegistered = false;
+	private _wasmFinalizing = false;
+	private _wasmFinalizeRetryCount = 0;
+	private _wasmFinalizeRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	private _wasmExtensions: IExtensionManifestSummary[] = [];
+	private _wasmPollTimer: ReturnType<typeof setTimeout> | undefined;
+	private _wasmDocSyncInitialized = false;
+
 	constructor(
 		@ILogService private readonly logService: ILogService,
 		@ILanguageFeaturesService private readonly languageFeatures: ILanguageFeaturesService,
@@ -236,7 +253,14 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		try {
 			const bootstrap = await bootstrapExtensionPlatform();
 			this._applyBootstrap(bootstrap);
-			this._connect(bootstrap.transport.endpoint);
+			// Connect to Node extension host via WebSocket only when available.
+			// When Node is missing, transport.kind === 'disabled' and we skip
+			// the WebSocket connection entirely — WASM-only mode.
+			if (bootstrap.transport?.kind === 'websocket') {
+				this._connect(bootstrap.transport.endpoint);
+			} else if (bootstrap.transport?.kind === 'disabled') {
+				this.logService.info('[ExtHost] Node transport disabled; running WASM-only mode');
+			}
 		} catch (error) {
 			this.logService.warn(`[ExtHost] platform bootstrap failed ${(error as Error)?.message ?? String(error)}`);
 		}
@@ -295,17 +319,26 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 
 	private _applyBootstrap(bootstrap: IExtensionPlatformBootstrap): void {
 		this._bootstrapExtensions = bootstrap.extensions || [];
+		this._wasmExtensions = this._bootstrapExtensions.filter(e => e.kind === 'wasm');
 
-		const wasmExtensions = this._bootstrapExtensions.filter(e => e.kind === 'wasm');
-		if (wasmExtensions.length > 0) {
+		// Listen for the WASM ready event from the Rust backend.
+		if (this._wasmExtensions.length > 0) {
 			listen<number>('sidex-wasm-extensions-ready', () => {
-				this.logService.info('[ExtHost] WASM extensions ready');
-				this._syncDocumentsToWasm();
-				setTimeout(() => {
-					this._registerWasmProviders();
-					this._registerWasmViewsAndCommands(wasmExtensions);
-				}, 200);
+				this.logService.info('[ExtHost] WASM ready event received');
+				this._wasmRuntimeReady = true;
+				this._tryFinalizeWasmRegistration('ready-event');
 			}).catch(() => {});
+		}
+
+		// Mark bootstrap as seen; may trigger finalize if runtime is already ready.
+		this._wasmBootstrapSeen = true;
+		this._tryFinalizeWasmRegistration('bootstrap');
+
+		// Start polling for WASM runtime readiness as a fallback.
+		// This covers the race where the ready event fires before our listener
+		// is attached, and also works when Node is missing (WASM-only mode).
+		if (this._wasmExtensions.length > 0) {
+			this._startWasmPoll();
 		}
 
 		const workspaceFolders = this._getWorkspaceFolders();
@@ -314,7 +347,112 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		this._syncDocumentsToWasm();
 	}
 
-	private _wasmDocSyncInitialized = false;
+	private _startWasmPoll(): void {
+		const extIds = this._wasmExtensions.map(e => e.id);
+		const delays = [100, 250, 500, 1000, 1000, 2000, 2000, 5000];
+		let attempt = 0;
+		const poll = () => {
+			// Poll only stops once registration is confirmed successful.
+			// _wasmRuntimeReady alone is NOT sufficient — finalize may fail.
+			if (this._wasmRegistered) {
+				return;
+			}
+			listWasmExtensions().then(loaded => {
+				const allLoaded = extIds.every(id => loaded.includes(id));
+				if (allLoaded) {
+					this.logService.info(`[ExtHost] WASM poll: all ${extIds.length} extensions loaded`);
+					this._wasmRuntimeReady = true;
+					this._tryFinalizeWasmRegistration('poll');
+				}
+				// Keep polling even after runtime is ready — finalize may fail
+				// and we need to detect that registration hasn't completed.
+				if (!this._wasmRegistered && attempt < delays.length) {
+					this._wasmPollTimer = setTimeout(poll, delays[attempt]);
+					attempt++;
+				} else if (!this._wasmRegistered) {
+					this.logService.warn(`[ExtHost] WASM poll exhausted: expected ${extIds.join(',')}, loaded ${loaded.join(',')}`);
+				}
+			}).catch(() => {
+				if (!this._wasmRegistered && attempt < delays.length) {
+					this._wasmPollTimer = setTimeout(poll, delays[attempt]);
+					attempt++;
+				}
+			});
+		};
+		poll();
+	}
+
+	private _scheduleWasmFinalizeRetry(reason: string): void {
+		if (this._wasmRegistered || this._wasmFinalizing) {
+			return;
+		}
+		// Don't stack multiple retry timers
+		if (this._wasmFinalizeRetryTimer) {
+			this.logService.info(`[ExtHost] WASM retry already scheduled, skipping duplicate for: ${reason}`);
+			return;
+		}
+		const delays = [250, 500, 1000, 2000];
+		if (this._wasmFinalizeRetryCount >= delays.length) {
+			this.logService.warn(`[ExtHost] WASM finalize retry exhausted for: ${reason}`);
+			return;
+		}
+		const delay = delays[this._wasmFinalizeRetryCount];
+		this._wasmFinalizeRetryCount++;
+		this.logService.info(`[ExtHost] WASM finalize retry ${this._wasmFinalizeRetryCount}/${delays.length} in ${delay}ms (reason: ${reason})`);
+		this._wasmFinalizeRetryTimer = setTimeout(() => {
+			this._wasmFinalizeRetryTimer = undefined;
+			this._tryFinalizeWasmRegistration('retry:' + reason);
+		}, delay);
+	}
+
+	private async _tryFinalizeWasmRegistration(reason: string): Promise<void> {
+		if (this._wasmRegistered || this._wasmFinalizing) {
+			return;
+		}
+		if (!this._wasmBootstrapSeen) {
+			this.logService.info(`[ExtHost] WASM defer finalize (${reason}): bootstrap not yet seen`);
+			return;
+		}
+		if (!this._wasmRuntimeReady) {
+			this.logService.info(`[ExtHost] WASM defer finalize (${reason}): runtime not yet ready`);
+			return;
+		}
+		if (this._wasmExtensions.length === 0) {
+			return;
+		}
+
+		this._wasmFinalizing = true;
+		this.logService.info(`[ExtHost] Finalizing WASM ready (triggered by ${reason})`);
+		let retryReason: string | undefined;
+		try {
+			this._syncDocumentsToWasm();
+			await this._registerWasmProviders();
+			await this._registerWasmViewsAndCommands(this._wasmExtensions);
+			// All registration succeeded — mark as done.
+			this._wasmRegistered = true;
+			// Clean up timers.
+			if (this._wasmPollTimer) {
+				clearTimeout(this._wasmPollTimer);
+				this._wasmPollTimer = undefined;
+			}
+			if (this._wasmFinalizeRetryTimer) {
+				clearTimeout(this._wasmFinalizeRetryTimer);
+				this._wasmFinalizeRetryTimer = undefined;
+			}
+			this._wasmFinalizeRetryCount = 0;
+			this.logService.info('[ExtHost] WASM ready finalized successfully');
+		} catch (e) {
+			this.logService.warn(`[ExtHost] WASM finalize failed (${reason}):`, e);
+			retryReason = reason;
+		} finally {
+			this._wasmFinalizing = false;
+		}
+		// Schedule retry outside the try-finally so _wasmFinalizing is already
+		// false when _scheduleWasmFinalizeRetry checks it.
+		if (retryReason && !this._wasmRegistered) {
+			this._scheduleWasmFinalizeRetry(retryReason);
+		}
+	}
 
 	private _syncDocumentsToWasm(): void {
 		for (const model of this.modelService.getModels()) {
@@ -544,6 +682,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	private async _registerWasmViewsAndCommands(wasmExtensions: IExtensionManifestSummary[]): Promise<void> {
 		const viewsRegistry = Registry.as<IViewsRegistry>(ViewExtensions.ViewsRegistry);
 		const viewContainersRegistry = Registry.as<IViewContainersRegistry>(ViewExtensions.ViewContainersRegistry);
+		const errors: string[] = [];
 		for (const ext of wasmExtensions) {
 			try {
 				const meta = await wasmGetExtensionMetadata(ext.id);
@@ -581,13 +720,13 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 					for (const viewId of meta.viewIds) {
 						const existing = viewsRegistry.getView(viewId) as ITreeViewDescriptor | null;
 						if (existing?.treeView) {
-							continue;
+							continue; // already registered, treat as success
 						}
 						try {
 							const treeView = this.instantiationService.createInstance(TreeView, viewId, viewId);
 							const explorerContainer = viewContainersRegistry.get('workbench.view.explorer');
 							if (!explorerContainer) {
-								this.logService.warn(`[ExtHost] Explorer container not found, skipping view ${viewId}`);
+								errors.push(`Explorer container not found for view ${viewId}`);
 								continue;
 							}
 							viewsRegistry.registerViews([{
@@ -598,7 +737,6 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 								canToggleVisibility: true,
 								collapsed: true,
 							} as ITreeViewDescriptor], explorerContainer);
-							// Set WASM-backed data provider
 							treeView.dataProvider = {
 								getChildren: async (element) => {
 									const elementId = element ? (element as any).handle : null;
@@ -613,15 +751,31 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 								},
 							};
 							this._treeViews.set(viewId, treeView);
+							this._register(treeView.onDidChangeSelectionAndFocus(({ selection }) => {
+								for (const item of selection) {
+									const handle = (item as any).handle;
+									if (handle) {
+										wasmOnTreeItemActivated(ext.id, viewId, handle)
+											.catch(err => this.logService.warn(`[ExtHost] wasmOnTreeItemActivated failed: ${err}`));
+									}
+								}
+							}));
+							this._register(treeView.onDidChangeVisibility((visible) => {
+								wasmOnTreeVisibilityChanged(ext.id, viewId, visible)
+									.catch(err => this.logService.warn(`[ExtHost] wasmOnTreeVisibilityChanged failed: ${err}`));
+							}));
 							this.logService.info(`[ExtHost] Registered WASM tree view: ${viewId}`);
 						} catch (e) {
-							this.logService.warn(`[ExtHost] Failed to register WASM tree view ${viewId}:`, e);
+							errors.push(`view ${viewId}: ${(e as Error)?.message ?? String(e)}`);
 						}
 					}
 				}
 			} catch (e) {
-				this.logService.warn(`[ExtHost] Failed to register WASM views/commands for ${ext.id}:`, e);
+				errors.push(`ext ${ext.id}: ${(e as Error)?.message ?? String(e)}`);
 			}
+		}
+		if (errors.length > 0) {
+			throw new Error(`WASM registration failed: ${errors.join('; ')}`);
 		}
 	}
 

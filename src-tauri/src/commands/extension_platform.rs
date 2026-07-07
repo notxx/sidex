@@ -756,16 +756,14 @@ pub async fn extension_platform_bootstrap(
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let port = supervisor.ensure_started(&app, &init_data_json, &search_paths)?;
-
-    let node = resolve_node_runtime(&app)?;
-
+    // Load WASM extensions BEFORE Node extension host startup.
+    // WASM extensions have no dependency on Node runtime, so they should
+    // load even when Node is missing (SIDEX_NODE_BINARY unset).
     let wasm_manifests: Vec<ExtensionManifest> = manifests
         .iter()
         .filter(|m| m.kind == ExtensionKind::Wasm && m.wasm_binary.is_some())
         .cloned()
         .collect();
-
     if !wasm_manifests.is_empty() {
         let runtime = wasm_runtime.inner().clone();
         let app_handle = app.clone();
@@ -782,6 +780,31 @@ pub async fn extension_platform_bootstrap(
             let _ = app_handle.emit("sidex-wasm-extensions-ready", count);
         });
     }
+
+    // Start Node extension host. Only ERR_NODE_MISSING is graceful;
+    // other errors (port conflict, spawn failure) still propagate.
+    let (port, node_available, node_error, node_path, node_version, node_source, node_bundled): (
+        u16, bool, Option<String>, String, Option<String>, &str, bool,
+    ) = match supervisor.ensure_started(&app, &init_data_json, &search_paths) {
+        Ok(p) => {
+            match resolve_node_runtime(&app) {
+                Ok(n) => (p, true, None, n.path, n.version, n.source, n.bundled),
+                Err(e) => {
+                    log::warn!("[platform] Node resolved but ensure_started OK; unexpected: {e}");
+                    (p, true, Some(e.to_string()), String::new(), None, "error", false)
+                }
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.starts_with("ERR_NODE_MISSING") {
+                log::info!("[platform] Node not found; WASM-only mode");
+                (0, false, Some(msg), String::new(), None, "missing", false)
+            } else {
+                return Err(msg);
+            }
+        }
+    };
 
     let summaries: Vec<serde_json::Value> = manifests
         .iter()
@@ -801,10 +824,38 @@ pub async fn extension_platform_bootstrap(
         })
         .collect();
 
+    let session_id = supervisor.snapshot()
+        .ok()
+        .and_then(|s| s.session_id)
+        .unwrap_or_default();
+
+    // Build transport info; disable when Node is missing
+    let transport = if node_available {
+        serde_json::json!({
+            "kind": "websocket",
+            "endpoint": format!("ws://127.0.0.1:{port}/")
+        })
+    } else {
+        serde_json::json!({
+            "kind": "disabled",
+            "endpoint": "",
+            "reason": "Node runtime not found"
+        })
+    };
+
+    let node_info = serde_json::json!({
+        "path": node_path,
+        "version": node_version,
+        "source": node_source,
+        "bundled": node_bundled,
+    });
+
     Ok(serde_json::json!({
-                "sessionId": supervisor.snapshot()?.session_id.unwrap_or_default(),
-        "transport": { "kind": "websocket", "endpoint": format!("ws://127.0.0.1:{port}/") },
-        "runtime": { "path": node.path, "version": node.version, "source": "system", "bundled": false },
+        "sessionId": session_id,
+        "nodeAvailable": node_available,
+        "nodeError": node_error,
+        "transport": transport,
+        "runtime": node_info,
         "paths": {
             "serverScript": resolve_server_script(&app).to_string_lossy(),
             "builtinExtensionsDir": resolve_builtin_extensions_dir(&app).to_string_lossy(),
